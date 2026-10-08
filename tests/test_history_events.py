@@ -4,6 +4,7 @@
 """Tests for the vocal history push-event proxy in AmazonEchoApi."""
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
@@ -11,9 +12,17 @@ import pytest
 
 from aioamazondevices import api as api_module
 from aioamazondevices.api import AmazonEchoApi
-from aioamazondevices.structures import AmazonVocalRecord
+from aioamazondevices.structures import AmazonDevice, AmazonVocalRecord
 
 from .const import TEST_SERIAL_1, TEST_SERIAL_2
+
+
+@pytest.fixture(autouse=True)
+def known_devices(api: AmazonEchoApi, make_device: Callable[..., AmazonDevice]) -> None:
+    """Load device types used by filtered probes."""
+    api._device_handler.devices.update(
+        {serial: make_device(serial) for serial in (TEST_SERIAL_1, TEST_SERIAL_2)}
+    )
 
 
 def _record(timestamp: int, *, reply: str = "") -> AmazonVocalRecord:
@@ -93,7 +102,7 @@ async def test_probe_retries_until_matching_reply_and_deduplicates(
             {TEST_SERIAL_1: fresh},
         ]
     )
-    monkeypatch.setattr(api, "_shared_vocal_history_fetch", fetch)
+    monkeypatch.setattr(api._history_handler, "get_vocal_history", fetch)
     monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
 
     await api._probe_vocal_history(TEST_SERIAL_1)
@@ -109,33 +118,35 @@ async def test_probe_retries_until_matching_reply_and_deduplicates(
 
 
 @pytest.mark.anyio
-async def test_simultaneous_probes_share_history_request(
+async def test_simultaneous_probes_fetch_each_device_independently(
     api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Concurrent Echo probes await one in-flight RAH fetch."""
-    started = asyncio.Event()
+    """Both device requests start before either completes."""
+    received = _subscribe(api)
+    started = {serial: asyncio.Event() for serial in (TEST_SERIAL_1, TEST_SERIAL_2)}
     release = asyncio.Event()
     record = _record(100)
 
-    async def fetch() -> dict[str, AmazonVocalRecord]:
-        started.set()
+    async def fetch(
+        *, device_serial_number: str, device_type: str
+    ) -> dict[str, AmazonVocalRecord]:
+        assert device_type == "A1B2C3"
+        started[device_serial_number].set()
         await release.wait()
-        return {TEST_SERIAL_1: record}
+        return {device_serial_number: record}
 
     mock_fetch = AsyncMock(side_effect=fetch)
     monkeypatch.setattr(api._history_handler, "get_vocal_history", mock_fetch)
-    first = asyncio.create_task(api._shared_vocal_history_fetch())
-    await started.wait()
-    second = asyncio.create_task(api._shared_vocal_history_fetch())
-    await asyncio.sleep(0)
-    release.set()
-
-    results = list(await asyncio.gather(first, second))
-    assert results == [
-        {TEST_SERIAL_1: record},
-        {TEST_SERIAL_1: record},
+    tasks = [
+        asyncio.create_task(api._probe_vocal_history(serial)) for serial in started
     ]
-    mock_fetch.assert_awaited_once()
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in started.values())), 1
+    )
+    release.set()
+    await asyncio.gather(*tasks)
+    assert mock_fetch.await_count == len(started)
+    assert received == [{TEST_SERIAL_1: record}, {TEST_SERIAL_2: record}]
 
 
 @pytest.mark.anyio
@@ -153,7 +164,7 @@ async def test_push_during_probe_runs_again_for_latest_activity(
     newer = _record(1_020_100)
     fetch_count = 0
 
-    async def fetch() -> dict[str, AmazonVocalRecord]:
+    async def fetch(**_kwargs: str) -> dict[str, AmazonVocalRecord]:
         nonlocal fetch_count
         fetch_count += 1
         if fetch_count == 1:
@@ -201,12 +212,12 @@ async def test_push_during_probe_runs_again_for_latest_activity(
 async def test_stop_cancels_pending_history_activity(
     api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Shutdown cancels both the probe and its shared history request."""
+    """Shutdown cancels the probe and its device history request."""
     received = _subscribe(api)
     started = asyncio.Event()
     cancelled = asyncio.Event()
 
-    async def fetch() -> dict[str, AmazonVocalRecord]:
+    async def fetch(**_kwargs: str) -> dict[str, AmazonVocalRecord]:
         started.set()
         try:
             await asyncio.Event().wait()
@@ -227,7 +238,6 @@ async def test_stop_cancels_pending_history_activity(
     assert not received
     assert not api._history_probe_tasks
     assert not api._history_activity_timestamps
-    assert api._history_fetch_task is None
 
 
 @pytest.mark.anyio
@@ -268,7 +278,7 @@ async def test_probe_expires_without_fresh_history(
     received = _subscribe(api)
     api._last_emitted_history[TEST_SERIAL_1] = 1
     fetch = AsyncMock(side_effect=[{}, {TEST_SERIAL_1: _record(1)}] * 2)
-    monkeypatch.setattr(api, "_shared_vocal_history_fetch", fetch)
+    monkeypatch.setattr(api._history_handler, "get_vocal_history", fetch)
     monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
 
     await api._probe_vocal_history(TEST_SERIAL_1)
@@ -286,7 +296,7 @@ async def test_shutdown_cancels_probe_created_while_stream_stops(
     received = _subscribe(api)
     started = asyncio.Event()
 
-    async def fetch() -> dict[str, AmazonVocalRecord]:
+    async def fetch(**_kwargs: str) -> dict[str, AmazonVocalRecord]:
         started.set()
         await asyncio.Event().wait()
         return {}
@@ -308,7 +318,6 @@ async def test_shutdown_cancels_probe_created_while_stream_stops(
     assert api._http2_client is None
     assert not api._history_probe_tasks
     assert not api._history_activity_timestamps
-    assert api._history_fetch_task is None
     assert not received
 
 

@@ -40,7 +40,9 @@ class AmazonHistoryHandler:
         # force initial refresh
         self._csrf_a2z_refresh_time = datetime.now(UTC) - timedelta(days=2)
 
-    async def _vocal_history_json(self) -> dict[str, Any]:
+    async def _vocal_history_json(
+        self, *, device_serial_number: str | None = None, device_type: str | None = None
+    ) -> dict[str, Any]:
         """Request vocal history data."""
         await self._update_vocal_history_token()
 
@@ -57,10 +59,15 @@ class AmazonHistoryHandler:
             - timedelta(days=7)
         ).timestamp() * 1000
         end_time = datetime.now(UTC).timestamp() * 1000
-        query_string = {
+        query_string: dict[str, int | str] = {
             "startTime": int(start_time),
             "endTime": int(end_time),
         }
+        if device_serial_number is not None:
+            if not device_type:
+                raise ValueError("A device type is required for filtered history")
+            query_string["deviceSerialNumber"] = device_serial_number
+            query_string["deviceType"] = device_type
         url = URL.joinpath(self._session_state_data.retail_site_url, URI_HISTORY_DATA)
         url = url.with_query(query_string)
         _, raw_res = await self._http_wrapper.session_request(
@@ -77,12 +84,19 @@ class AmazonHistoryHandler:
         _LOGGER.debug("Vocal history data: %s", history)
         return history
 
-    async def get_vocal_history(self) -> dict[str, AmazonVocalRecord]:
+    async def get_vocal_history(
+        self, *, device_serial_number: str | None = None, device_type: str | None = None
+    ) -> dict[str, AmazonVocalRecord]:
         """Get vocal history."""
         # Give backend the time to update
         await asyncio.sleep(BACKEND_REFRESH_WAIT_SECONDS)
 
-        history_json = await self._vocal_history_json()
+        if device_serial_number is None:
+            history_json = await self._vocal_history_json()
+        else:
+            history_json = await self._vocal_history_json(
+                device_serial_number=device_serial_number, device_type=device_type
+            )
 
         records: dict[str, AmazonVocalRecord] = {}
         for record in history_json["alexaHistoryRecords"]:
@@ -107,6 +121,8 @@ class AmazonHistoryHandler:
             if not isinstance(device_info, dict):
                 continue
             serial = device_info["deviceSerialNumber"]
+            if device_serial_number is not None and serial != device_serial_number:
+                continue
             timestamp = record["timestamp"]
             person_info = record.get("personsInfo")
             if isinstance(person_info, list):

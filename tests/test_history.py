@@ -3,11 +3,14 @@
 
 """Tests for Alexa vocal history parsing."""
 
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from yarl import URL
 
+from aioamazondevices.const.http import REFRESH_ACCESS_TOKEN, URI_HISTORY_DATA
 from aioamazondevices.implementation import history as history_module
 from aioamazondevices.implementation.history import AmazonHistoryHandler
 
@@ -86,3 +89,40 @@ async def test_vocal_history_exposes_speaker(
     assert (record.person_first_name, record.person_type) == expected
     # personId is in the payload but account-scoped, so it is deliberately not exposed
     assert not hasattr(record, "person_id")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("filtered", [False, True])
+async def test_rah_device_filter_query(
+    handler: AmazonHistoryHandler, filtered: bool
+) -> None:
+    """Only device probes add both device parameters to the RAH POST."""
+    handler._session_state_data = SimpleNamespace(
+        retail_site_url=URL("https://www.amazon.ca"),
+        login_stored_data={REFRESH_ACCESS_TOKEN: "test-token"},
+    )
+    handler._update_vocal_history_token = AsyncMock()
+    handler._http_wrapper.refresh_data.return_value = (True, None)
+    handler._http_wrapper.session_request.return_value = (None, "response")
+    handler._http_wrapper.response_to_json.return_value = {"alexaHistoryRecords": []}
+    kwargs = (
+        {"device_serial_number": TEST_SERIAL_1, "device_type": "A1B2C3"}
+        if filtered
+        else {}
+    )
+
+    await handler.get_vocal_history(**kwargs)
+
+    call = handler._http_wrapper.session_request.await_args.kwargs
+    assert call["method"] == "POST"
+    assert call["url"].path.endswith(URI_HISTORY_DATA)
+    assert call["input_data"] == {"previousRequestToken": None}
+    query = call["url"].query
+    assert "startTime" in query
+    assert "endTime" in query
+    if filtered:
+        assert query["deviceSerialNumber"] == TEST_SERIAL_1
+        assert query["deviceType"] == "A1B2C3"
+    else:
+        assert "deviceSerialNumber" not in query
+        assert "deviceType" not in query

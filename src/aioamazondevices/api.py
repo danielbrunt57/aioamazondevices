@@ -152,9 +152,6 @@ class AmazonEchoApi:
         self._history_probe_tasks: dict[str, asyncio.Task[None]] = {}
         self._history_activity_timestamps: dict[str, int] = {}
         self._last_emitted_history: dict[str, int] = {}
-        self._history_fetch_task: asyncio.Task[dict[str, AmazonVocalRecord]] | None = (
-            None
-        )
 
         # force initial refresh
         initial_time = datetime.now(UTC) - timedelta(days=2)
@@ -329,10 +326,6 @@ class AmazonEchoApi:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._history_probe_tasks.clear()
         self._history_activity_timestamps.clear()
-        if self._history_fetch_task is not None:
-            self._history_fetch_task.cancel()
-            await asyncio.gather(self._history_fetch_task, return_exceptions=True)
-            self._history_fetch_task = None
 
     async def _http2_push_event_handler(
         self, event_type: str, payload: dict[str, Any]
@@ -427,8 +420,15 @@ class AmazonEchoApi:
                 if not self.on_history_event.frozen:
                     return
 
-                # All Echo candidates in this round can examine one response.
-                vocal_history = await self._shared_vocal_history_fetch()
+                device = self._device_handler.devices.get(serial)
+                if device is None:
+                    _LOGGER.debug(
+                        "History probe: unknown EQ serial=%s, skipping", serial
+                    )
+                    return
+                vocal_history = await self._history_handler.get_vocal_history(
+                    device_serial_number=serial, device_type=device.device_type
+                )
                 record = vocal_history.get(serial)
                 if (
                     record is not None
@@ -460,14 +460,6 @@ class AmazonEchoApi:
             _LOGGER.exception(
                 "Unexpected history probe failure for EQ serial=%s", serial
             )
-
-    async def _shared_vocal_history_fetch(self) -> dict[str, AmazonVocalRecord]:
-        """Share an in-flight history request among simultaneous Echo probes."""
-        if self._history_fetch_task is None or self._history_fetch_task.done():
-            self._history_fetch_task = asyncio.create_task(
-                self._history_handler.get_vocal_history()
-            )
-        return await asyncio.shield(self._history_fetch_task)
 
     async def _handle_audio_player_state_event(self) -> None:
         if not self._device_handler.devices:
