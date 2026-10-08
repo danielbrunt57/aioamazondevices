@@ -47,6 +47,7 @@ from .exceptions import (
     CannotConnect,
     CannotRetrieveData,
 )
+from .implementation.request_metrics import RequestMetrics
 from .structures import AmazonSaveDataConfig
 from .utils import _LOGGER, scrub_fields
 
@@ -167,9 +168,15 @@ class AmazonHttpWrapper:
         self._session = client_session
         self._session_state_data: AmazonSessionStateData = session_state_data
         self._save_data = save_data
+        self._request_metrics = RequestMetrics()
 
         self._csrf_cookie: str | None = None
         self._cookies: dict[str, str] = self._build_init_cookies()
+
+    @property
+    def request_metrics(self) -> dict[str, Any]:
+        """Return HTTP attempt counts for live diagnostics (reset on restart)."""
+        return self._request_metrics.snapshot()
 
     @property
     def cookies(self) -> dict[str, str]:
@@ -298,6 +305,32 @@ class AmazonHttpWrapper:
         _LOGGER.debug("Unexpected refresh data response")
         return False, {}
 
+    async def _counted_request(
+        self,
+        method: str,
+        url: URL,
+        *,
+        data: dict[str, Any] | list[dict[str, Any]] | bytes | None,
+        headers: dict[str, str],
+    ) -> ClientResponse:
+        """Measure each client request, including wrapper retries."""
+        attempt = self._request_metrics.start(f"{method} {url.path}")
+        try:
+            response = await self._session.request(
+                method, url, data=data, headers=headers
+            )
+            attempt.status = response.status
+            attempt.failed = response.status >= HTTPStatus.BAD_REQUEST
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            attempt.failed = True
+            raise
+        else:
+            return response
+        finally:
+            self._request_metrics.maybe_log()
+
     async def session_request(
         self,
         method: str,
@@ -361,13 +394,12 @@ class AmazonHttpWrapper:
                 await asyncio.sleep(delay)
 
             try:
-                resp = await self._session.request(
+                resp = await self._counted_request(
                     method,
                     url,
                     data=input_data if not json_data else orjson.dumps(input_data),
                     headers=headers,
                 )
-
             except (TimeoutError, ClientConnectionError) as exc:
                 _LOGGER.warning("Connection error to %s: %s", url, repr(exc))
                 raise CannotConnect(f"Connection error during {method}") from exc
