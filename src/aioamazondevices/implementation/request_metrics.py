@@ -3,7 +3,8 @@
 
 """In-memory HTTP request metrics for live experiments."""
 
-from collections import Counter, deque
+import re
+from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from time import monotonic
@@ -39,6 +40,16 @@ class RequestMetrics:
         """Count an attempt immediately before calling the HTTP client."""
         now = monotonic()
         self._prune(now)
+        endpoint = re.sub(
+            r"/devicesTypes/[^/]+/deviceId/[^/]+(?=/|$)",
+            "/devicesTypes/{deviceType}/deviceId/{deviceSerialNumber}",
+            endpoint,
+        )
+        endpoint = re.sub(
+            r"(/alexashoppinglists/api/v2/lists)/[^/]+(/items(?:/|$))",
+            r"\1/{listId}\2",
+            endpoint,
+        )
         attempt = RequestAttempt(now, endpoint)
         self._attempts.append(attempt)
         self._total += 1
@@ -65,9 +76,25 @@ class RequestMetrics:
                 "http_429": sum(
                     a.status == HTTPStatus.TOO_MANY_REQUESTS for a in attempts
                 ),
-                "endpoints": dict(Counter(a.endpoint for a in attempts)),
+                "endpoints": self._endpoint_summary(attempts),
             }
         return result
+
+    @staticmethod
+    def _endpoint_summary(attempts: list[RequestAttempt]) -> dict[str, Any]:
+        """Group counts, failures and response statuses by normalized endpoint."""
+        endpoints: dict[str, Any] = {}
+        for attempt in attempts:
+            counts = endpoints.setdefault(
+                attempt.endpoint, {"requests": 0, "failures": 0, "statuses": {}}
+            )
+            counts["requests"] += 1
+            counts["failures"] += int(attempt.failed)
+            status = (
+                str(attempt.status) if attempt.status is not None else "no_response"
+            )
+            counts["statuses"][status] = counts["statuses"].get(status, 0) + 1
+        return endpoints
 
     def maybe_log(self) -> None:
         """Log at most once a minute, when an HTTP attempt finishes."""

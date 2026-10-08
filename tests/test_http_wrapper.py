@@ -65,7 +65,13 @@ async def test_request_metrics_count_retries_and_exclude_query(
         "requests": expected_attempts,
         "failures": 1,
         "http_429": 1,
-        "endpoints": {"GET /history": expected_attempts},
+        "endpoints": {
+            "GET /history": {
+                "requests": expected_attempts,
+                "failures": 1,
+                "statuses": {"429": 1, "200": 1},
+            }
+        },
     }
 
 
@@ -83,12 +89,74 @@ def test_request_metrics_rolling_windows_and_summary(
     metrics.maybe_log()
     metrics.maybe_log()
     snapshot = metrics.snapshot()
-    assert snapshot["minute"]["endpoints"] == {"GET /csd": 1}
+    assert snapshot["minute"]["endpoints"] == {
+        "GET /csd": {
+            "requests": 1,
+            "failures": 0,
+            "statuses": {"no_response": 1},
+        }
+    }
     expected_hour = 2
     assert snapshot["hour"]["requests"] == expected_hour
     assert caplog.text.count("HTTP request metrics") == 1
     now = 3601.0
-    assert metrics.snapshot()["hour"]["endpoints"] == {"GET /csd": 1}
+    assert metrics.snapshot()["hour"]["endpoints"] == {
+        "GET /csd": {
+            "requests": 1,
+            "failures": 0,
+            "statuses": {"no_response": 1},
+        }
+    }
     now = 86462.0
     assert metrics.snapshot()["day"]["requests"] == 0
     assert metrics.snapshot()["total_since_start"] == expected_hour
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected"),
+    [
+        (
+            "GET /devicesTypes/TYPE_A/deviceId/SERIAL_A/preferences",
+            "GET /devicesTypes/{deviceType}/deviceId/{deviceSerialNumber}/preferences",
+        ),
+        (
+            "POST /alexashoppinglists/api/v2/lists/private-list/items/fetch",
+            "POST /alexashoppinglists/api/v2/lists/{listId}/items/fetch",
+        ),
+        (
+            "POST /alexashoppinglists/api/v2/lists/fetch",
+            "POST /alexashoppinglists/api/v2/lists/fetch",
+        ),
+        ("POST /auth/token", "POST /auth/token"),
+    ],
+)
+def test_request_metrics_normalizes_endpoint(endpoint: str, expected: str) -> None:
+    """Variable device/list identifiers are grouped; fixed endpoints stay intact."""
+    metrics = module.RequestMetrics()
+    metrics.start(endpoint)
+    assert list(metrics.snapshot()["minute"]["endpoints"]) == [expected]
+
+
+def test_request_metrics_attributes_failures_and_statuses() -> None:
+    """Device requests aggregate HTTP failures and failures without a response."""
+    metrics = module.RequestMetrics()
+    first = metrics.start("GET /devicesTypes/TYPE_A/deviceId/SERIAL_A/preferences")
+    first.status = 503
+    first.failed = True
+    second = metrics.start("GET /devicesTypes/TYPE_B/deviceId/SERIAL_B/preferences")
+    second.status = 200
+    third = metrics.start("GET /devicesTypes/TYPE_C/deviceId/SERIAL_C/preferences")
+    third.failed = True
+    counts = metrics.snapshot()["minute"]["endpoints"]
+    endpoint = (
+        "GET /devicesTypes/{deviceType}/deviceId/{deviceSerialNumber}/preferences"
+    )
+    expected_requests = 3
+    expected_failures = 2
+    assert counts == {
+        endpoint: {
+            "requests": expected_requests,
+            "failures": expected_failures,
+            "statuses": {"503": 1, "200": 1, "no_response": 1},
+        }
+    }
