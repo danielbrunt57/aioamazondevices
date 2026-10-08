@@ -126,3 +126,34 @@ async def test_rah_device_filter_query(
     else:
         assert "deviceSerialNumber" not in query
         assert "deviceType" not in query
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "utterance_type", ["FALSE_WAKE_WORD_1P", "FALSE_WAKE_WORD_2P", "FALSE_WAKE_WORD"]
+)
+@pytest.mark.parametrize("with_older_record", [False, True])
+async def test_false_wake_does_not_replace_qualifying_history(
+    handler: AmazonHistoryHandler, utterance_type: str, with_older_record: bool
+) -> None:
+    """False wakes are excluded before choosing the latest record per device."""
+    older = _record(None)
+    false_wake = {
+        **older,
+        "timestamp": older["timestamp"] + 1,
+        "utteranceType": utterance_type,
+        "title": "",
+        "subTitle": "",
+    }
+    payload = [false_wake, older] if with_older_record else [false_wake]
+    handler._vocal_history_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={"alexaHistoryRecords": payload}
+    )
+
+    records = await handler.get_vocal_history()
+
+    if with_older_record:
+        assert records[TEST_SERIAL_1].timestamp == older["timestamp"]
+        assert records[TEST_SERIAL_1].title == older["title"]
+    else:
+        assert records == {}

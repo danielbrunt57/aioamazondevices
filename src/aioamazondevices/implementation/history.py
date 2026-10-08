@@ -101,7 +101,7 @@ class AmazonHistoryHandler:
         records: dict[str, AmazonVocalRecord] = {}
         for record in history_json["alexaHistoryRecords"]:
             _LOGGER.debug("Processing vocal history record: %s", record)
-            utterance_type = record.get("utteranceType")
+            utterance_type = str(record.get("utteranceType") or "")
             device_info = record.get("deviceInfo")
             if (
                 utterance_type
@@ -111,6 +111,7 @@ class AmazonHistoryHandler:
                     "NO_EXPRESSED_INTENT",
                     "WAKE_WORD_ONLY",
                 ]
+                or utterance_type.startswith("FALSE_WAKE_WORD")
                 # InvokeRoutineIntent, AddToListIntent are not linked to a device
                 or device_info is None
             ):

@@ -6,12 +6,14 @@
 import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from aioamazondevices import api as api_module
 from aioamazondevices.api import AmazonEchoApi
+from aioamazondevices.implementation import history as history_module
 from aioamazondevices.structures import AmazonDevice, AmazonVocalRecord
 
 from .const import TEST_SERIAL_1, TEST_SERIAL_2
@@ -381,3 +383,52 @@ async def test_history_sync_does_not_regress_timestamp_baseline(
 
     assert await api.sync_history_state() == {TEST_SERIAL_1: older}
     assert api._last_emitted_history[TEST_SERIAL_1] == latest_timestamp
+
+
+@pytest.mark.anyio
+async def test_probe_retries_false_wake_without_advancing_baseline(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A false wake cannot finish a probe or suppress the later genuine record."""
+    received = _subscribe(api)
+    baseline_timestamp = 100
+    api._last_emitted_history[TEST_SERIAL_1] = baseline_timestamp
+    false_wake = {
+        "timestamp": 300,
+        "utteranceType": "FALSE_WAKE_WORD_1P",
+        "deviceInfo": {"deviceSerialNumber": TEST_SERIAL_1},
+        "title": "",
+        "subTitle": "",
+    }
+    genuine = {
+        **false_wake,
+        "timestamp": 200,
+        "utteranceType": "GENERAL",
+        "title": "what time is it",
+        "subTitle": "It's 4:02 p.m.",
+    }
+
+    async def fetch(**_kwargs: str) -> dict[str, Any]:
+        assert api._last_emitted_history[TEST_SERIAL_1] == baseline_timestamp
+        return {"alexaHistoryRecords": [false_wake]}
+
+    calls = 0
+
+    async def history_json(**kwargs: str) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return await fetch(**kwargs)
+        return {"alexaHistoryRecords": [false_wake, genuine]}
+
+    monkeypatch.setattr(api._history_handler, "_vocal_history_json", history_json)
+    monkeypatch.setattr(history_module, "BACKEND_REFRESH_WAIT_SECONDS", 0)
+    monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
+
+    await api._probe_vocal_history(TEST_SERIAL_1)
+
+    expected_attempts = 2
+    assert calls == expected_attempts
+    assert api._last_emitted_history[TEST_SERIAL_1] == genuine["timestamp"]
+    assert len(received) == 1
+    assert received[0][TEST_SERIAL_1].title == genuine["title"]
