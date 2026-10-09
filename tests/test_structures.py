@@ -32,7 +32,7 @@ def test_voice_control_supported(
 @pytest.mark.parametrize(
     ("history_type", "title", "expected"),
     [
-        ("ROUTINES_3P", "", "Activity initiated by routine"),
+        ("ROUTINES_3P", "", "Initiated by routine"),
         ("ROUTINES_3P", "Amazon title", "Amazon title"),
         ("ROUTINES_OR_TAP_TO_ALEXA", "", ""),
         ("conversation", "Date/Time Request", "Date/Time Request"),

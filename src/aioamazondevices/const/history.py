@@ -6,4 +6,4 @@
 HISTORY_RETRY_DELAY_SECONDS = 4
 HISTORY_PROBE_ATTEMPTS = 4
 
-ROUTINE_ACTIVITY_TITLE = "Activity initiated by routine"
+ROUTINE_ACTIVITY_TITLE = "Initiated by routine"
