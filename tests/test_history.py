@@ -157,3 +157,166 @@ async def test_false_wake_does_not_replace_qualifying_history(
         assert records[TEST_SERIAL_1].title == older["title"]
     else:
         assert records == {}
+
+
+def _turn(  # noqa: PLR0913 - mirrors a conversation fragment
+    purpose: str,
+    text: str,
+    timestamp: str,
+    uri: str,
+    *,
+    related: str | None = None,
+    variant: bool = False,
+) -> dict[str, Any]:
+    return {
+        "utteranceId": uri,
+        "createTime": timestamp,
+        "fragment": {
+            "fragmentURI": uri,
+            "metadata": {
+                "purpose": purpose,
+                "relationships": [{"type": "RELATES_TO", "fragmentURI": related}]
+                if related
+                else [],
+            },
+            "content": None if variant else {"text": text},
+            "variants": [{"content": {"text": text}}] if variant else [],
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_conversation_details_replace_labels(
+    handler: AmazonHistoryHandler,
+) -> None:
+    """Keep the category but obtain the latest command/reply from CSD."""
+    raw = {
+        **_record(None),
+        "recordType": "conversation",
+        "title": "Date/Time Request",
+        "subTitle": "What time is it?",
+    }
+    raw.pop("utteranceType")
+    handler._vocal_history_json = AsyncMock(return_value={"alexaHistoryRecords": [raw]})
+    detail = {
+        "conversationTurns": [
+            _turn("USER", "old question", "2026-10-07T08:30:00Z", "old"),
+            _turn(
+                "AGENT", "old reply", "2026-10-07T08:30:01Z", "old-agent", related="old"
+            ),
+            _turn("USER", "What time is it?", "2026-10-07T08:37:34.776Z", "new"),
+            _turn(
+                "AGENT",
+                "It's 1:37 a.m.",
+                "2026-10-07T08:37:35.334Z",
+                "new-agent",
+                related="new",
+                variant=True,
+            ),
+        ]
+    }
+    handler._conversation_detail_json = AsyncMock(return_value=detail)
+    record = (await handler.get_vocal_history())[TEST_SERIAL_1]
+    assert record.activity_title == "Date/Time Request"
+    assert record.voice_command == "What time is it?"
+    assert record.voice_reply == "It's 1:37 a.m."
+    expected_timestamp = 1791362254776
+    assert record.timestamp == expected_timestamp
+
+
+@pytest.mark.anyio
+async def test_user_without_reply_and_empty_details(
+    handler: AmazonHistoryHandler,
+) -> None:
+    """No reply is legitimate; empty CSD details must not become a baseline."""
+    raw = {**_record(None), "recordType": "conversation", "title": "Request"}
+    handler._vocal_history_json = AsyncMock(return_value={"alexaHistoryRecords": [raw]})
+    handler._conversation_detail_json = AsyncMock(
+        side_effect=[
+            {"conversationTurns": []},
+            {
+                "conversationTurns": [
+                    _turn("USER", "Good night.", "2026-10-07T14:36:07.295Z", "user")
+                ]
+            },
+        ]
+    )
+    assert await handler.get_vocal_history() == {}
+    record = (await handler.get_vocal_history())[TEST_SERIAL_1]
+    assert record.voice_command == "Good night."
+    assert record.voice_reply == ""
+
+
+@pytest.mark.anyio
+async def test_csd_query_uses_rah_identifiers(handler: AmazonHistoryHandler) -> None:
+    """Use the RAH start time and account identifiers, keeping the GET method."""
+    handler._session_state_data = SimpleNamespace(
+        retail_site_url=URL("https://www.amazon.ca"),
+        login_stored_data={REFRESH_ACCESS_TOKEN: "test-token"},
+    )
+    handler._http_wrapper.session_request.return_value = (
+        None,
+        SimpleNamespace(status=200),
+    )
+    handler._http_wrapper.response_to_json.return_value = {"conversationTurns": []}
+    await handler._conversation_detail_json(
+        {
+            "conversationId": "conversation",
+            "customerId": "customer",
+            "startTime": 123,
+            "timestamp": 456,
+        }
+    )
+    call = handler._http_wrapper.session_request.await_args.kwargs
+    assert call["method"] == "GET"
+    assert call["url"].path == "/alexa-privacy/apd/csd/customer-conversation-detail"
+    assert dict(call["url"].query) == {
+        "conversationId": "conversation",
+        "customerId": "customer",
+        "timestamp": "123",
+        "sort": "ASCENDING",
+    }
+
+
+@pytest.mark.anyio
+async def test_utterance_uses_asr_and_tts_content(
+    handler: AmazonHistoryHandler,
+) -> None:
+    """Routine reply-only content and actual ASR text retain their meanings."""
+    raw = {
+        **_record(None),
+        "title": "category",
+        "subTitle": "summary",
+        "voiceHistoryRecordItems": [
+            {"recordItemType": "ASR_REPLACEMENT_TEXT", "transcriptText": ""},
+            {
+                "recordItemType": "TTS_REPLACEMENT_TEXT",
+                "transcriptText": "Home Assistant has started",
+            },
+        ],
+    }
+    handler._vocal_history_json = AsyncMock(return_value={"alexaHistoryRecords": [raw]})
+    record = (await handler.get_vocal_history())[TEST_SERIAL_1]
+    assert record.activity_title == "category"
+    assert record.voice_command == ""
+    assert record.voice_reply == "Home Assistant has started"
+
+
+def test_latest_user_never_inherits_previous_reply() -> None:
+    """A delayed AGENT fragment must remain linked to its original USER turn."""
+    detail = {
+        "conversationTurns": [
+            _turn("USER", "old", "2026-10-07T08:30:00Z", "old"),
+            _turn("USER", "new", "2026-10-07T08:31:00Z", "new"),
+            _turn(
+                "AGENT",
+                "delayed old reply",
+                "2026-10-07T08:32:00Z",
+                "agent",
+                related="old",
+            ),
+        ]
+    }
+    exchange = AmazonHistoryHandler._parse_conversation(detail)
+    assert exchange is not None
+    assert exchange[:2] == ("new", "")

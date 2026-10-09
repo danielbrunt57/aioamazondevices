@@ -195,6 +195,13 @@ class AmazonVocalRecord:
     # Speaker recognised by an Alexa voice profile, when Amazon provides one
     person_first_name: str | None = None
     person_type: str | None = None
+    voice_command: str = ""
+    voice_reply: str = ""
+
+    @property
+    def activity_title(self) -> str:
+        """Return Amazon's display title independently of spoken content."""
+        return self.title
 
 
 class AmazonListType(StrEnum):

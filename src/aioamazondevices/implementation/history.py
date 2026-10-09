@@ -5,7 +5,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from http import HTTPMethod
+from http import HTTPMethod, HTTPStatus
 from typing import Any
 
 from bs4 import Tag
@@ -14,6 +14,7 @@ from yarl import URL
 from aioamazondevices.const.http import (
     CSRF_A2Z,
     REFRESH_ACCESS_TOKEN,
+    URI_CONVERSATION_DETAIL,
     URI_HISTORY_DATA,
     URI_HISTORY_FRONTEND,
 )
@@ -96,6 +97,7 @@ class AmazonHistoryHandler:
                 device_serial_number=device_serial_number, device_type=device_type
             )
 
+        candidates: dict[str, dict[str, Any]] = {}
         records: dict[str, AmazonVocalRecord] = {}
         for record in history_json["alexaHistoryRecords"]:
             _LOGGER.debug("Processing vocal history record: %s", record)
@@ -122,7 +124,34 @@ class AmazonHistoryHandler:
             serial = device_info["deviceSerialNumber"]
             if device_serial_number is not None and serial != device_serial_number:
                 continue
+            if (
+                serial not in candidates
+                or record["timestamp"] > candidates[serial]["timestamp"]
+            ):
+                candidates[serial] = record
+
+        for serial, record in candidates.items():
             timestamp = record["timestamp"]
+            utterance_type = str(record.get("utteranceType") or "")
+            command = ""
+            reply = ""
+            if record.get("recordType") == "conversation":
+                try:
+                    detail = await self._conversation_detail_json(record)
+                except CannotRetrieveData:
+                    _LOGGER.exception(
+                        "Conversation details unavailable for serial=%s", serial
+                    )
+                    continue
+                exchange = self._parse_conversation(detail)
+                if exchange is None:
+                    # Do not advance the baseline while details are unavailable.
+                    continue
+                command, reply, turn_timestamp = exchange
+                if turn_timestamp is not None:
+                    timestamp = turn_timestamp
+            else:
+                command, reply = self._parse_utterance(record)
             person_info = record.get("personsInfo")
             if isinstance(person_info, list):
                 person_info = person_info[0] if person_info else None
@@ -136,12 +165,139 @@ class AmazonHistoryHandler:
                 sub_title=record["subTitle"],
                 person_first_name=person_info.get("personFirstName"),
                 person_type=person_info.get("personType"),
+                voice_command=command,
+                voice_reply=reply,
             )
             # Store only the latest record per serial number
             if serial not in records or timestamp > records[serial].timestamp:
                 records[serial] = new_record
 
         return records
+
+    @staticmethod
+    def _parse_utterance(record: dict[str, Any]) -> tuple[str, str]:
+        """Read spoken content without using conversation category labels."""
+        items = record.get("voiceHistoryRecordItems")
+        if not isinstance(items, list):
+            return str(record.get("title") or ""), str(record.get("subTitle") or "")
+        texts = {}
+        for kind in ("ASR_REPLACEMENT_TEXT", "TTS_REPLACEMENT_TEXT"):
+            texts[kind] = " ".join(
+                str(item["transcriptText"])
+                for item in items
+                if isinstance(item, dict)
+                and item.get("recordItemType") == kind
+                and item.get("transcriptText")
+            )
+        return texts["ASR_REPLACEMENT_TEXT"], texts["TTS_REPLACEMENT_TEXT"]
+
+    async def _conversation_detail_json(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Get conversation turns using the identifiers supplied by RAH."""
+        if not record.get("conversationId") or not record.get("customerId"):
+            raise CannotRetrieveData("Missing conversation identifiers")
+        url = URL.joinpath(
+            self._session_state_data.retail_site_url, URI_CONVERSATION_DETAIL
+        ).with_query(
+            {
+                "conversationId": record["conversationId"],
+                "timestamp": record.get("startTime") or record["timestamp"],
+                "sort": "ASCENDING",
+                "customerId": record["customerId"],
+            }
+        )
+        access_token = self._session_state_data.login_stored_data[REFRESH_ACCESS_TOKEN]
+        _, response = await self._http_wrapper.session_request(
+            method=HTTPMethod.GET,
+            url=url,
+            extended_headers={
+                "Authorization": f"Bearer {access_token}",
+                CSRF_A2Z: self._csrf_a2z_token,
+            },
+        )
+        if response.status != HTTPStatus.OK:
+            raise CannotRetrieveData(f"Conversation detail returned {response.status}")
+        return await self._http_wrapper.response_to_json(
+            response, "conversation detail"
+        )
+
+    @staticmethod
+    def _fragment_text(fragment: dict[str, Any]) -> str:
+        """Read text from the primary content or its alternative variants."""
+        content = fragment.get("content")
+        if isinstance(content, dict) and isinstance(content.get("text"), str):
+            return content["text"]
+        for variant in fragment.get("variants") or []:
+            if not isinstance(variant, dict):
+                continue
+            content = variant.get("content")
+            if isinstance(content, dict) and isinstance(content.get("text"), str):
+                return content["text"]
+        return ""
+
+    @staticmethod
+    def _turn_timestamp(turn: dict[str, Any]) -> int | None:
+        """Convert the conversation turn timestamp to Amazon milliseconds."""
+        fragment = turn.get("fragment") or {}
+        value = turn.get("createTime") or fragment.get("timestamp")
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                return None
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _parse_conversation(
+        cls, detail: dict[str, Any]
+    ) -> tuple[str, str, int | None] | None:
+        """Select the latest USER turn and only its associated AGENT responses."""
+        turns = detail.get("conversationTurns") or []
+        users = [
+            turn
+            for turn in turns
+            if isinstance(turn, dict)
+            and isinstance(turn.get("fragment"), dict)
+            and (turn["fragment"].get("metadata") or {}).get("purpose") == "USER"
+            and cls._fragment_text(turn["fragment"]).strip()
+        ]
+        if not users:
+            return None
+        user = max(
+            enumerate(users),
+            key=lambda pair: (cls._turn_timestamp(pair[1]) or 0, pair[0]),
+        )[1]
+        fragment = user["fragment"]
+        user_uri = fragment.get("fragmentURI")
+        user_timestamp = cls._turn_timestamp(user)
+        replies: list[str] = []
+        for turn in turns:
+            if not isinstance(turn, dict) or not isinstance(turn.get("fragment"), dict):
+                continue
+            agent = turn["fragment"]
+            metadata = agent.get("metadata") or {}
+            if metadata.get("purpose") != "AGENT":
+                continue
+            relationships = metadata.get("relationships") or []
+            related = any(
+                isinstance(rel, dict)
+                and rel.get("type") == "RELATES_TO"
+                and user_uri
+                and rel.get("fragmentURI") == user_uri
+                for rel in relationships
+            )
+            if not relationships:
+                agent_timestamp = cls._turn_timestamp(turn)
+                related = bool(
+                    user.get("utteranceId")
+                    and turn.get("utteranceId") == user["utteranceId"]
+                    and user_timestamp is not None
+                    and agent_timestamp is not None
+                    and agent_timestamp >= user_timestamp
+                )
+            if related and (text := cls._fragment_text(agent)):
+                replies.append(text)
+        return cls._fragment_text(fragment), " ".join(replies), user_timestamp
 
     async def _update_vocal_history_token(self) -> None:
         """Find anti-csrftoken-a2z token."""
