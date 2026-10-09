@@ -10,6 +10,8 @@ from enum import StrEnum
 from os import PathLike
 from typing import Any
 
+from .const.history import ROUTINE_ACTIVITY_TITLE
+
 
 @dataclass
 class AmazonSaveDataConfig:
@@ -201,6 +203,8 @@ class AmazonVocalRecord:
     @property
     def activity_title(self) -> str:
         """Return Amazon's display title independently of spoken content."""
+        if not self.title and self.history_type == "ROUTINES_3P":
+            return ROUTINE_ACTIVITY_TITLE
         return self.title
 
 
