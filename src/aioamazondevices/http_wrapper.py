@@ -8,6 +8,7 @@ import base64
 import secrets
 from http import HTTPMethod, HTTPStatus
 from http.cookies import Morsel, SimpleCookie
+from time import time
 from typing import Any, cast
 
 import orjson
@@ -169,6 +170,7 @@ class AmazonHttpWrapper:
         self._session_state_data: AmazonSessionStateData = session_state_data
         self._save_data = save_data
         self._request_metrics = RequestMetrics()
+        self._access_token_lock = asyncio.Lock()
 
         self._csrf_cookie: str | None = None
         self._cookies: dict[str, str] = self._build_init_cookies()
@@ -257,6 +259,19 @@ class AmazonHttpWrapper:
 
         return HTTPStatus(error).phrase
 
+    async def ensure_access_token(self) -> bool:
+        """Reuse a valid access token, sharing refreshes between history workers."""
+        async with self._access_token_lock:
+            login_data = self._session_state_data.login_stored_data
+            try:
+                expires = float(login_data.get("expires") or 0)
+            except (TypeError, ValueError):
+                expires = 0
+            if login_data.get(REFRESH_ACCESS_TOKEN) and expires > time() + 60:
+                return True
+            successful, _ = await self.refresh_data(REFRESH_ACCESS_TOKEN)
+            return successful
+
     async def refresh_data(self, data_type: str) -> tuple[bool, dict[str, Any]]:
         """Refresh data."""
         if not self._session_state_data.login_stored_data:
@@ -297,6 +312,13 @@ class AmazonHttpWrapper:
             new_token := json_response.get(REFRESH_ACCESS_TOKEN)
         ):
             self._session_state_data.login_stored_data[REFRESH_ACCESS_TOKEN] = new_token
+            try:
+                expires_in = float(json_response.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                expires_in = 0
+            self._session_state_data.login_stored_data["expires"] = time() + max(
+                expires_in, 0
+            )
             return True, json_response
 
         if data_type == REFRESH_AUTH_COOKIES:

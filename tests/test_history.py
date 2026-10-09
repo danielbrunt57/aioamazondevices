@@ -102,7 +102,7 @@ async def test_rah_device_filter_query(
         login_stored_data={REFRESH_ACCESS_TOKEN: "test-token"},
     )
     handler._update_vocal_history_token = AsyncMock()
-    handler._http_wrapper.refresh_data.return_value = (True, None)
+    handler._http_wrapper.ensure_access_token.return_value = True
     handler._http_wrapper.session_request.return_value = (None, "response")
     handler._http_wrapper.response_to_json.return_value = {"alexaHistoryRecords": []}
     kwargs = (

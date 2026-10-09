@@ -3,7 +3,9 @@
 
 """Tests for the HTTP wrapper."""
 
+import asyncio
 from http import HTTPMethod
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -160,3 +162,79 @@ def test_request_metrics_attributes_failures_and_statuses() -> None:
             "statuses": {"503": 1, "200": 1, "no_response": 1},
         }
     }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("expires", [None, 900, 1030, "invalid"])
+async def test_history_access_token_refresh_shared(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch, expires: object
+) -> None:
+    """Concurrent history workers refresh an expired/unknown token only once."""
+    wrapper = api._http_wrapper
+    wrapper._session_state_data.login_stored_data = {
+        "access_token": "old",
+        "refresh_token": "refresh",
+        "expires": expires,
+    }
+    monkeypatch.setattr(http_wrapper, "time", lambda: 1000)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def request(**_kwargs: object) -> tuple[dict, object]:
+        started.set()
+        await release.wait()
+        return {}, SimpleNamespace(status=200)
+
+    request_mock = AsyncMock(side_effect=request)
+    monkeypatch.setattr(wrapper, "session_request", request_mock)
+    monkeypatch.setattr(
+        wrapper,
+        "response_to_json",
+        AsyncMock(return_value={"access_token": "new", "expires_in": "3600"}),
+    )
+    first = asyncio.create_task(wrapper.ensure_access_token())
+    await started.wait()
+    second = asyncio.create_task(wrapper.ensure_access_token())
+    release.set()
+    assert await asyncio.gather(first, second) == [True, True]
+    request_mock.assert_awaited_once()
+    expected_expiration = 4600
+    assert (
+        wrapper._session_state_data.login_stored_data["expires"] == expected_expiration
+    )
+    assert wrapper._session_state_data.login_stored_data["access_token"] == "new"  # noqa: S105
+
+
+@pytest.mark.anyio
+async def test_history_access_token_reused(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token with sufficient lifetime causes no refresh request."""
+    wrapper = api._http_wrapper
+    wrapper._session_state_data.login_stored_data = {
+        "access_token": "valid",
+        "expires": 4600,
+    }
+    monkeypatch.setattr(http_wrapper, "time", lambda: 1000)
+    refresh = AsyncMock()
+    monkeypatch.setattr(wrapper, "refresh_data", refresh)
+    assert await wrapper.ensure_access_token()
+    refresh.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_history_access_token_refresh_failure_retries(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed refresh is not cached as a valid token."""
+    wrapper = api._http_wrapper
+    wrapper._session_state_data.login_stored_data = {
+        "access_token": "old",
+        "expires": 0,
+    }
+    refresh = AsyncMock(return_value=(False, {}))
+    monkeypatch.setattr(wrapper, "refresh_data", refresh)
+    assert not await wrapper.ensure_access_token()
+    assert not await wrapper.ensure_access_token()
+    expected_attempts = 2
+    assert refresh.await_count == expected_attempts

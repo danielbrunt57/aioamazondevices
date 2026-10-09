@@ -46,9 +46,7 @@ class AmazonHistoryHandler:
         """Request vocal history data."""
         await self._update_vocal_history_token()
 
-        refresh_successful, _ = await self._http_wrapper.refresh_data(
-            REFRESH_ACCESS_TOKEN
-        )
+        refresh_successful = await self._http_wrapper.ensure_access_token()
         if not refresh_successful:
             _LOGGER.warning("Access token refresh failed")
 
