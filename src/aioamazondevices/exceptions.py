@@ -26,6 +26,15 @@ class CannotRetrieveData(AmazonError):
     """Exception raised when data retrieval fails."""
 
 
+class ServiceUnavailable(CannotRetrieveData):
+    """A 503 response, including the server's optional retry guidance."""
+
+    def __init__(self, message: str, retry_after: str | None = None) -> None:
+        """Preserve Retry-After for callers that defer optional reads."""
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class NoOnlineDevicesError(AmazonError):
     """Exception raised when no online devices are found."""
 

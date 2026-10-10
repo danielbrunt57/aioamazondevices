@@ -47,6 +47,7 @@ from .exceptions import (
     CannotAuthenticate,
     CannotConnect,
     CannotRetrieveData,
+    ServiceUnavailable,
 )
 from .implementation.request_metrics import RequestMetrics
 from .structures import AmazonSaveDataConfig
@@ -353,13 +354,15 @@ class AmazonHttpWrapper:
         finally:
             self._request_metrics.maybe_log()
 
-    async def session_request(
+    async def session_request(  # noqa: PLR0913, PLR0915
         self,
         method: str,
         url: URL,
         input_data: dict[str, Any] | list[dict[str, Any]] | None = None,
         json_data: bool = False,
         extended_headers: dict[str, str] | None = None,
+        *,
+        retry_server_errors: bool = True,
     ) -> tuple[BeautifulSoup, ClientResponse]:
         """Return request response context data."""
         _LOGGER.debug(
@@ -428,11 +431,14 @@ class AmazonHttpWrapper:
 
             # Retry with a delay only for specific HTTP status
             # that can benefits of a back-off
-            if resp.status not in [
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                HTTPStatus.SERVICE_UNAVAILABLE,
-                HTTPStatus.TOO_MANY_REQUESTS,
-            ]:
+            if resp.status != HTTPStatus.TOO_MANY_REQUESTS and (
+                not retry_server_errors
+                or resp.status
+                not in (
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            ):
                 break
 
         if resp is None:
@@ -462,6 +468,13 @@ class AmazonHttpWrapper:
             if not await self._ignore_ap_signin_error(
                 resp
             ) and not await self._ignore_capabilities_error(resp):
+                if resp.status == HTTPStatus.SERVICE_UNAVAILABLE:
+                    retry_after = resp.headers.get("Retry-After")
+                    _LOGGER.debug("503 response Retry-After: %r", retry_after)
+                    raise ServiceUnavailable(
+                        f"Request failed: {await self.http_phrase_error(resp.status)}",
+                        retry_after=retry_after,
+                    )
                 raise CannotRetrieveData(
                     f"Request failed: {await self.http_phrase_error(resp.status)}"
                 )
