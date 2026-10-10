@@ -153,6 +153,7 @@ class AmazonEchoApi:
         self._history_probe_tasks: dict[str, asyncio.Task[None]] = {}
         self._history_activity_timestamps: dict[str, int] = {}
         self._last_emitted_history: dict[str, int] = {}
+        self._last_emitted_history_records: dict[str, AmazonVocalRecord] = {}
         self._history_last_volumes: dict[str, dict[str, Any]] = {}
         self._history_last_equalizers: dict[str, dict[str, Any]] = {}
 
@@ -461,11 +462,20 @@ class AmazonEchoApi:
                     device_serial_number=serial, device_type=device.device_type
                 )
                 record = vocal_history.get(serial)
-                if (
+                previous_timestamp = self._last_emitted_history.get(serial, 0)
+                previous = self._last_emitted_history_records.get(serial)
+                changed_content = (
                     record is not None
-                    and record.timestamp > self._last_emitted_history.get(serial, 0)
+                    and previous is not None
+                    and record.timestamp == previous_timestamp
+                    and record != previous
+                    and (not previous.voice_reply or bool(record.voice_reply))
+                )
+                if record is not None and (
+                    record.timestamp > previous_timestamp or changed_content
                 ):
                     self._last_emitted_history[serial] = record.timestamp
+                    self._last_emitted_history_records[serial] = record
                     _LOGGER.debug(
                         "Emitting history for serial=%s timestamp=%s type=%s",
                         serial,
@@ -473,7 +483,10 @@ class AmazonEchoApi:
                         record.history_type,
                     )
                     await self._emit_history_event({serial: record})
-                    return
+                    # USER-only conversations are valid, but the AGENT turn may
+                    # still arrive during this probe's remaining attempts.
+                    if record.history_type != "conversation" or record.voice_reply:
+                        return
 
                 _LOGGER.debug(
                     "No fresh completed history for serial=%s (attempt %s/%s)",
@@ -714,6 +727,14 @@ class AmazonEchoApi:
         history = await self._history_handler.get_vocal_history()
         # Use Amazon record timestamps, since EQ pushes can arrive much later.
         for serial, record in history.items():
+            previous = self._last_emitted_history_records.get(serial)
+            if record.timestamp >= self._last_emitted_history.get(serial, 0) and (
+                previous is None
+                or record.timestamp > previous.timestamp
+                or not previous.voice_reply
+                or record.voice_reply
+            ):
+                self._last_emitted_history_records[serial] = record
             self._last_emitted_history[serial] = max(
                 record.timestamp, self._last_emitted_history.get(serial, 0)
             )

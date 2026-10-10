@@ -5,6 +5,7 @@
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -563,3 +564,76 @@ async def test_shutdown_clears_push_heuristic_caches(api: AmazonEchoApi) -> None
     await api.stop_http2_processing()
     assert not api._history_last_volumes
     assert not api._history_last_equalizers
+
+
+@pytest.mark.anyio
+async def test_conversation_reply_arriving_later_updates_same_interaction(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publish USER immediately, then publish AGENT enrichment at the same time."""
+    received = _subscribe(api)
+    command = replace(
+        _record(100), history_type="conversation", voice_command="What time?"
+    )
+    complete = replace(command, voice_reply="It's 9:03 p.m.")
+    fetch = AsyncMock(
+        side_effect=[
+            {TEST_SERIAL_1: command},
+            {TEST_SERIAL_1: command},
+            {TEST_SERIAL_1: complete},
+        ]
+    )
+    monkeypatch.setattr(api._history_handler, "get_vocal_history", fetch)
+    monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
+
+    await api._probe_vocal_history(TEST_SERIAL_1)
+
+    assert received == [{TEST_SERIAL_1: command}, {TEST_SERIAL_1: complete}]
+    assert api._last_emitted_history[TEST_SERIAL_1] == command.timestamp
+    assert api._last_emitted_history_records[TEST_SERIAL_1] == complete
+
+
+@pytest.mark.anyio
+async def test_command_only_conversation_publishes_once_and_finishes(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routine-triggering USER turn needs no reply to be a valid interaction."""
+    received = _subscribe(api)
+    command = replace(
+        _record(100), history_type="conversation", voice_command="Good night."
+    )
+    fetch = AsyncMock(return_value={TEST_SERIAL_1: command})
+    monkeypatch.setattr(api._history_handler, "get_vocal_history", fetch)
+    monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
+
+    await api._probe_vocal_history(TEST_SERIAL_1)
+
+    assert received == [{TEST_SERIAL_1: command}]
+    assert fetch.await_count == api_module.HISTORY_PROBE_ATTEMPTS
+
+
+@pytest.mark.anyio
+async def test_enrichment_after_startup_and_stale_content_do_not_regress(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enrich the startup baseline, then ignore identical, older or incomplete data."""
+    received = _subscribe(api)
+    command = replace(
+        _record(100), history_type="conversation", voice_command="What time?"
+    )
+    complete = replace(command, voice_reply="It's 9:03 p.m.")
+    fetch = AsyncMock(return_value={TEST_SERIAL_1: command})
+    monkeypatch.setattr(api._history_handler, "get_vocal_history", fetch)
+    monkeypatch.setattr(api_module, "HISTORY_RETRY_DELAY_SECONDS", 0)
+    await api.sync_history_state()
+    fetch.return_value = {TEST_SERIAL_1: complete}
+    await api._probe_vocal_history(TEST_SERIAL_1)
+    for stale in (complete, command, replace(complete, timestamp=99)):
+        fetch.return_value = {TEST_SERIAL_1: stale}
+        await api._probe_vocal_history(TEST_SERIAL_1)
+    fetch.return_value = {TEST_SERIAL_1: command}
+    await api.sync_history_state()
+
+    assert received == [{TEST_SERIAL_1: complete}]
+    assert api._last_emitted_history_records[TEST_SERIAL_1] == complete
+    assert api._last_emitted_history[TEST_SERIAL_1] == complete.timestamp
