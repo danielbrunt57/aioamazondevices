@@ -266,9 +266,7 @@ async def test_unexpected_probe_error_is_logged_and_task_cleaned_up(
     assert not received
     assert not api._history_probe_tasks
     assert not api._history_activity_timestamps
-    assert (
-        f"Unexpected history probe failure for EQ serial={TEST_SERIAL_1}" in caplog.text
-    )
+    assert f"Unexpected history probe failure for serial={TEST_SERIAL_1}" in caplog.text
     assert "RuntimeError: unexpected history failure" in caplog.text
 
 
@@ -432,3 +430,136 @@ async def test_probe_retries_false_wake_without_advancing_baseline(
     assert api._last_emitted_history[TEST_SERIAL_1] == genuine["timestamp"]
     assert len(received) == 1
     assert received[0][TEST_SERIAL_1].title == genuine["title"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("volume_push", [False, True], ids=["eq", "volume"])
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        ("first", True),
+        ("unchanged", True),
+        ("changed", False),
+        ("recent_other", True),
+        ("boundary_other", False),
+        ("other_device", False),
+    ],
+)
+async def test_activity_push_matches_alexa_remote2_conditions(
+    api: AmazonEchoApi,
+    monkeypatch: pytest.MonkeyPatch,
+    volume_push: bool,
+    scenario: str,
+    expected: bool,
+) -> None:
+    """Match first/repeated settings and the strict per-device two-second window."""
+    _subscribe(api)
+    now_ms = 1_000_000
+    clock = Mock()
+    clock.now.return_value = datetime.fromtimestamp(now_ms / 1000, UTC)
+    monkeypatch.setattr(api_module, "datetime", clock)
+    probe = AsyncMock()
+    monkeypatch.setattr(api, "_probe_vocal_history", probe)
+    own = api._history_last_volumes if volume_push else api._history_last_equalizers
+    other = api._history_last_equalizers if volume_push else api._history_last_volumes
+    settings = (
+        {"volumeSetting": 50, "isMuted": False}
+        if volume_push
+        else {"bass": 0, "treble": 0, "midrange": 0}
+    )
+    if scenario != "first":
+        own[TEST_SERIAL_1] = {**settings, "updated": now_ms - 3000}
+        if scenario != "unchanged":
+            own[TEST_SERIAL_1]["volumeSetting" if volume_push else "bass"] = 25
+    if scenario in {"recent_other", "boundary_other", "other_device"}:
+        serial = TEST_SERIAL_2 if scenario == "other_device" else TEST_SERIAL_1
+        other[serial] = {
+            "updated": now_ms - (2000 if scenario == "boundary_other" else 1999)
+        }
+
+    api._handle_push_as_history_proxy(
+        {"dopplerId": {"deviceSerialNumber": TEST_SERIAL_1}, **settings},
+        volume_push=volume_push,
+    )
+    await asyncio.gather(*api._history_probe_tasks.values())
+
+    assert probe.await_count == int(expected)
+    assert own[TEST_SERIAL_1] == {**settings, "updated": now_ms}
+
+
+@pytest.mark.anyio
+async def test_volume_push_dispatch_also_probes_history(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A volume-only push probes history and retains normal volume processing."""
+    _subscribe(api)
+    probe = AsyncMock()
+    monkeypatch.setattr(api, "_probe_vocal_history", probe)
+    sync = AsyncMock()
+    emit = AsyncMock()
+    monkeypatch.setattr(api._media_handler, "sync_device_volumes", sync)
+    monkeypatch.setattr(api, "_emit_volume_state_event", emit)
+
+    await api._http2_push_event_handler(
+        "PUSH_VOLUME_CHANGE",
+        {
+            "dopplerId": {"deviceSerialNumber": TEST_SERIAL_1},
+            "volumeSetting": 80,
+            "isMuted": False,
+        },
+    )
+    await asyncio.gather(*api._history_probe_tasks.values())
+
+    probe.assert_awaited_once_with(TEST_SERIAL_1)
+    sync.assert_awaited_once()
+    emit.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_eq_and_volume_share_worker_and_preserve_later_push(
+    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A volume push during an EQ probe queues newer activity on the same worker."""
+    _subscribe(api)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def probe(serial: str) -> None:
+        nonlocal calls
+        assert serial == TEST_SERIAL_1
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(api, "_probe_vocal_history", probe)
+    clock = Mock()
+    clock.now.side_effect = [
+        datetime.fromtimestamp(1000, UTC),
+        datetime.fromtimestamp(1000.5, UTC),
+    ]
+    monkeypatch.setattr(api_module, "datetime", clock)
+    payload = {"dopplerId": {"deviceSerialNumber": TEST_SERIAL_1}}
+    await api._handle_eq_event_as_history_proxy(payload)
+    task = api._history_probe_tasks[TEST_SERIAL_1]
+    await entered.wait()
+    api._handle_push_as_history_proxy(
+        {**payload, "volumeSetting": 50, "isMuted": False}, volume_push=True
+    )
+    assert api._history_probe_tasks[TEST_SERIAL_1] is task
+    release.set()
+    await task
+    expected_probes = 2
+    assert calls == expected_probes
+    assert not api._history_probe_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_clears_push_heuristic_caches(api: AmazonEchoApi) -> None:
+    """A restarted push stream gets the same first-push behavior as a new instance."""
+    api._history_last_volumes[TEST_SERIAL_1] = {"updated": 1}
+    api._history_last_equalizers[TEST_SERIAL_1] = {"updated": 1}
+    await api.stop_http2_processing()
+    assert not api._history_last_volumes
+    assert not api._history_last_equalizers

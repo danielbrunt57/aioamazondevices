@@ -23,6 +23,7 @@ from aioamazondevices.implementation.todo import AmazonToDoHandler
 from . import __version__
 from .const.history import (
     HISTORY_PROBE_ATTEMPTS,
+    HISTORY_PUSH_COALESCE_WINDOW_MS,
     HISTORY_RETRY_DELAY_SECONDS,
 )
 from .const.http import (
@@ -152,6 +153,8 @@ class AmazonEchoApi:
         self._history_probe_tasks: dict[str, asyncio.Task[None]] = {}
         self._history_activity_timestamps: dict[str, int] = {}
         self._last_emitted_history: dict[str, int] = {}
+        self._history_last_volumes: dict[str, dict[str, Any]] = {}
+        self._history_last_equalizers: dict[str, dict[str, Any]] = {}
 
         # force initial refresh
         initial_time = datetime.now(UTC) - timedelta(days=2)
@@ -326,6 +329,8 @@ class AmazonEchoApi:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._history_probe_tasks.clear()
         self._history_activity_timestamps.clear()
+        self._history_last_volumes.clear()
+        self._history_last_equalizers.clear()
 
     async def _http2_push_event_handler(
         self, event_type: str, payload: dict[str, Any]
@@ -347,6 +352,7 @@ class AmazonEchoApi:
                 _LOGGER.debug("Unhandled push event type: %s", event_type)
 
     async def _handle_volume_change_event(self, payload: dict[str, Any]) -> None:
+        self._handle_push_as_history_proxy(payload, volume_push=True)
         # Ensure initial full sync happens before applying incremental updates
         if not self._device_volumes_initialized:
             await self._media_handler.sync_device_volumes()
@@ -375,24 +381,51 @@ class AmazonEchoApi:
         await self._emit_volume_state_event()
 
     async def _handle_eq_event_as_history_proxy(self, payload: dict[str, Any]) -> None:
-        if not self.on_history_event.frozen:
-            _LOGGER.debug("No vocal history subscribers, skipping fetch")
-            return
+        self._handle_push_as_history_proxy(payload, volume_push=False)
+
+    def _handle_push_as_history_proxy(
+        self, payload: dict[str, Any], *, volume_push: bool
+    ) -> None:
+        """Apply alexa-remote2's activity heuristics to EQ and volume pushes."""
         serial = payload.get("dopplerId", {}).get("deviceSerialNumber")
-        destination_user_id = payload.get("destinationUserId")
-
         if not serial:
-            _LOGGER.debug("EQ history proxy: missing device serial, skipping")
             return
 
-        _LOGGER.debug(
-            "EQ history proxy: serial=%s user=%s",
-            serial,
-            destination_user_id,
+        activity_timestamp_ms = int(datetime.now(UTC).timestamp() * 1000)
+        own_cache = (
+            self._history_last_volumes if volume_push else self._history_last_equalizers
         )
+        other_cache = (
+            self._history_last_equalizers if volume_push else self._history_last_volumes
+        )
+        fields = (
+            ("volumeSetting", "isMuted")
+            if volume_push
+            else ("bass", "treble", "midrange")
+        )
+        previous = own_cache.get(serial)
+        other = other_cache.get(serial)
+        should_probe = (
+            previous is None
+            or all(previous.get(field) == payload.get(field) for field in fields)
+            or (
+                other is not None
+                and abs(activity_timestamp_ms - other["updated"])
+                < HISTORY_PUSH_COALESCE_WINDOW_MS
+            )
+        )
+        own_cache[serial] = {
+            **{field: payload.get(field) for field in fields},
+            "updated": activity_timestamp_ms,
+        }
+        source = "VOLUME" if volume_push else "EQ"
+        _LOGGER.debug(
+            "%s history proxy: serial=%s should_probe=%s", source, serial, should_probe
+        )
+        if not should_probe or not self.on_history_event.frozen:
+            return
 
         # Preserve newer activity while one probe is already running.
-        activity_timestamp_ms = int(datetime.now(UTC).timestamp() * 1000)
         self._history_activity_timestamps[serial] = activity_timestamp_ms
         if (task := self._history_probe_tasks.get(serial)) and not task.done():
             return
@@ -414,7 +447,7 @@ class AmazonEchoApi:
                 self._history_activity_timestamps.pop(serial, None)
 
     async def _probe_vocal_history(self, serial: str) -> None:
-        """Wait for a fresh history record for the Echo that sent the EQ push."""
+        """Wait for a fresh history record for the Echo that sent the push."""
         try:
             for attempt in range(1, HISTORY_PROBE_ATTEMPTS + 1):
                 if not self.on_history_event.frozen:
@@ -422,9 +455,7 @@ class AmazonEchoApi:
 
                 device = self._device_handler.devices.get(serial)
                 if device is None:
-                    _LOGGER.debug(
-                        "History probe: unknown EQ serial=%s, skipping", serial
-                    )
+                    _LOGGER.debug("History probe: unknown serial=%s, skipping", serial)
                     return
                 vocal_history = await self._history_handler.get_vocal_history(
                     device_serial_number=serial, device_type=device.device_type
@@ -436,7 +467,7 @@ class AmazonEchoApi:
                 ):
                     self._last_emitted_history[serial] = record.timestamp
                     _LOGGER.debug(
-                        "Emitting history for EQ serial=%s timestamp=%s type=%s",
+                        "Emitting history for serial=%s timestamp=%s type=%s",
                         serial,
                         record.timestamp,
                         record.history_type,
@@ -445,7 +476,7 @@ class AmazonEchoApi:
                     return
 
                 _LOGGER.debug(
-                    "No fresh completed history for EQ serial=%s (attempt %s/%s)",
+                    "No fresh completed history for serial=%s (attempt %s/%s)",
                     serial,
                     attempt,
                     HISTORY_PROBE_ATTEMPTS,
@@ -455,11 +486,9 @@ class AmazonEchoApi:
         except asyncio.CancelledError:
             raise
         except (AmazonError, TimeoutError):
-            _LOGGER.exception("History probe failed for EQ serial=%s", serial)
+            _LOGGER.exception("History probe failed for serial=%s", serial)
         except Exception:  # noqa: BLE001 - log failures at the background task boundary
-            _LOGGER.exception(
-                "Unexpected history probe failure for EQ serial=%s", serial
-            )
+            _LOGGER.exception("Unexpected history probe failure for serial=%s", serial)
 
     async def _handle_audio_player_state_event(self) -> None:
         if not self._device_handler.devices:
