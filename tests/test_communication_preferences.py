@@ -106,6 +106,7 @@ async def test_preferences_cache_continue_and_recover(
     sleep = AsyncMock()
     monkeypatch.setattr(http_wrapper.asyncio, "sleep", sleep)
     communications = api._communication_handler
+    monkeypatch.setattr(communication, "PREFERENCES_REFRESH_INTERVAL", 0)
     communications._communication_preferences["first"] = {"communications": "OFF"}
     app = web.Application()
     app.router.add_get(
@@ -124,6 +125,81 @@ async def test_preferences_cache_continue_and_recover(
         result = await communications.get_communication_preferences(devices)
         assert result["first"] == {"communications": "ON"}
     assert not [call for call in sleep.await_args_list if call.args[0]]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [200, 503])
+async def test_fifteen_minute_preferences_polling(
+    api: AmazonEchoApi,
+    make_device: Callable[..., AmazonDevice],
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    """Throttle successes and cold-cache failures, but fetch new devices immediately."""
+    now = 100.0
+    calls: list[str] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        calls.append(request.match_info["serial"])
+        return web.json_response(
+            {
+                "devicePermissionsPreferences": [
+                    {
+                        "devicePreference": "communications",
+                        "state": "ON",
+                        "allowed": True,
+                    }
+                ]
+            },
+            status=status,
+        )
+
+    monkeypatch.setattr(communication, "monotonic", lambda: now)
+    communications = api._communication_handler
+    app = web.Application()
+    app.router.add_get(
+        "/devicesTypes/{device_type}/deviceId/{serial}/preferences", handler
+    )
+    async with TestServer(app) as server:
+        communications._communication_site = server.make_url("/")
+        devices = [make_device("first")]
+        initial = dict(await communications.get_communication_preferences(devices))
+        for poll_time in (400.0, 700.0, 999.0):
+            now = poll_time
+            assert (
+                await communications.get_communication_preferences(devices) == initial
+            )
+        assert calls == ["first"]
+        devices.append(make_device("new"))
+        await communications.get_communication_preferences(devices)
+        assert calls == ["first", "new"]
+        now = 1000.0
+        await communications.get_communication_preferences(devices)
+        assert calls == ["first", "new", "first"]
+
+
+@pytest.mark.anyio
+async def test_retry_after_longer_than_poll_interval(
+    api: AmazonEchoApi,
+    make_device: Callable[..., AmazonDevice],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A longer server cooldown takes precedence over the fifteen-minute interval."""
+    now = 100.0
+    requests = AsyncMock(side_effect=communication.ServiceUnavailable("503", "1200"))
+    monkeypatch.setattr(api._http_wrapper, "session_request", requests)
+    monkeypatch.setattr(communication, "monotonic", lambda: now)
+    communications = api._communication_handler
+    devices = [make_device("first")]
+    await communications.get_communication_preferences(devices)
+    for poll_time in (1000.0, 1299.0):
+        now = poll_time
+        await communications.get_communication_preferences(devices)
+    requests.assert_awaited_once()
+    now = 1300.0
+    await communications.get_communication_preferences(devices)
+    expected_calls = 2
+    assert requests.await_count == expected_calls
 
 
 @pytest.mark.parametrize(
@@ -202,6 +278,7 @@ async def test_retry_after_defers_only_failing_device(  # noqa: PLR0913, PLR0917
     monkeypatch.setattr(communication, "monotonic", lambda: now)
     monkeypatch.setattr(communication, "time", lambda: 1445412480.0)
     communications = api._communication_handler
+    monkeypatch.setattr(communication, "PREFERENCES_REFRESH_INTERVAL", 0)
     communications._communication_preferences["first"] = {"communications": "OFF"}
     app = web.Application()
     app.router.add_get(

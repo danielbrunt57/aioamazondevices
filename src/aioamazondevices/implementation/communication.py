@@ -17,6 +17,8 @@ from aioamazondevices.http_wrapper import AmazonHttpWrapper, AmazonSessionStateD
 from aioamazondevices.structures import AmazonDevice, AmazonDropInStatus
 from aioamazondevices.utils import _LOGGER
 
+PREFERENCES_REFRESH_INTERVAL = 15 * 60
+
 
 def _retry_after_delay(value: str | None) -> float | None:
     """Parse Retry-After as delay-seconds or an HTTP date."""
@@ -50,6 +52,7 @@ class AlexaCommunicationsHandler:
         self._communication_site = URL(COMM_SITE)
         self._communication_preferences: dict[str, dict[str, str]] = {}
         self._preferences_retry_at: dict[str, float] = {}
+        self._preferences_refresh_at: dict[str, float] = {}
 
     async def _set_communications_state(
         self, preference: str, device: AmazonDevice, state: str
@@ -88,7 +91,7 @@ class AlexaCommunicationsHandler:
     async def get_communication_preferences(
         self, devices: list[AmazonDevice]
     ) -> dict[str, dict[str, str]]:
-        """Get communication preferences for a device."""
+        """Refresh each device's preferences at most every fifteen minutes."""
         for device in devices:
             if (
                 device.device_family == SPEAKER_GROUP_FAMILY
@@ -97,9 +100,14 @@ class AlexaCommunicationsHandler:
                 # avoid unnecessary call for devices that don't support communications
                 continue
 
-            if monotonic() < self._preferences_retry_at.get(device.serial_number, 0):
+            now = monotonic()
+            if now < max(
+                self._preferences_retry_at.get(device.serial_number, 0),
+                self._preferences_refresh_at.get(device.serial_number, 0),
+            ):
                 continue
             self._preferences_retry_at.pop(device.serial_number, None)
+            refresh_at = now + PREFERENCES_REFRESH_INTERVAL
 
             query_string = {
                 "devicePreferences": [
@@ -126,6 +134,8 @@ class AlexaCommunicationsHandler:
                     retry_server_errors=False,
                 )
             except CannotRetrieveData as err:
+                # Throttle failures too, including devices with no cached data.
+                self._preferences_refresh_at[device.serial_number] = refresh_at
                 if isinstance(err, ServiceUnavailable):
                     delay = _retry_after_delay(err.retry_after)
                     if delay is not None:
@@ -146,6 +156,7 @@ class AlexaCommunicationsHandler:
             resp_json = await self._http_wrapper.response_to_json(
                 resp, "devicesTypes(preferences)"
             )
+            self._preferences_refresh_at[device.serial_number] = refresh_at
 
             device_communication_preferences: dict[str, str] = {}
             for device_permissions_pref in resp_json.get(
