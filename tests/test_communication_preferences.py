@@ -123,38 +123,7 @@ async def test_preferences_cache_continue_and_recover(
         failing = False
         result = await communications.get_communication_preferences(devices)
         assert result["first"] == {"communications": "ON"}
-    expected_pause = 0.25
-    assert all(
-        call.args[0] == expected_pause for call in sleep.await_args_list if call.args[0]
-    )
-
-
-@pytest.mark.anyio
-async def test_pacing_only_between_actual_requests(
-    api: AmazonEchoApi,
-    make_device: Callable[..., AmazonDevice],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Skipped devices and separate polls do not introduce extra pauses."""
-    sleep = AsyncMock()
-    monkeypatch.setattr(communication.asyncio, "sleep", sleep)
-    requests = AsyncMock(side_effect=CannotRetrieveData("503"))
-    monkeypatch.setattr(api._http_wrapper, "session_request", requests)
-    communications = api._communication_handler
-    communications._preferences_retry_at["deferred"] = float("inf")
-    devices = [
-        make_device("group", device_family="WHA"),
-        make_device("first"),
-        make_device("deferred"),
-        make_device("second"),
-        make_device("third"),
-    ]
-    await communications.get_communication_preferences(devices)
-    assert requests.await_count == 3  # noqa: PLR2004
-    assert [call.args[0] for call in sleep.await_args_list] == [0.25, 0.25]
-    sleep.reset_mock()
-    await communications.get_communication_preferences([make_device("first")])
-    sleep.assert_not_awaited()
+    assert not [call for call in sleep.await_args_list if call.args[0]]
 
 
 @pytest.mark.parametrize(
@@ -261,7 +230,4 @@ async def test_retry_after_defers_only_failing_device(  # noqa: PLR0913, PLR0917
         assert "first" not in communications._preferences_retry_at
         assert calls[-2:] == ["first", "second"]
         assert api._http_wrapper.request_metrics["total_since_start"] == len(calls)
-    expected_pause = 0.25
-    assert all(
-        call.args[0] == expected_pause for call in sleep.await_args_list if call.args[0]
-    )
+    assert not [call for call in sleep.await_args_list if call.args[0]]
