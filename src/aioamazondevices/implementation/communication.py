@@ -3,6 +3,7 @@
 
 """Communication module for Amazon devices."""
 
+import asyncio
 from email.utils import parsedate_to_datetime
 from http import HTTPMethod
 from math import isfinite
@@ -89,6 +90,7 @@ class AlexaCommunicationsHandler:
         self, devices: list[AmazonDevice]
     ) -> dict[str, dict[str, str]]:
         """Get communication preferences for a device."""
+        request_sent = False
         for device in devices:
             if (
                 device.device_family == SPEAKER_GROUP_FAMILY
@@ -100,6 +102,12 @@ class AlexaCommunicationsHandler:
             if monotonic() < self._preferences_retry_at.get(device.serial_number, 0):
                 continue
             self._preferences_retry_at.pop(device.serial_number, None)
+
+            # Experimental pacing between actual reads, including failed reads.
+            # Skip the pause before the first request and for skipped devices.
+            if request_sent:
+                await asyncio.sleep(0.25)
+            request_sent = True
 
             query_string = {
                 "devicePreferences": [
