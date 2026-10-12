@@ -3,11 +3,13 @@
 
 """Communication module for Amazon devices."""
 
+import asyncio
 from email.utils import parsedate_to_datetime
 from http import HTTPMethod
 from math import isfinite
 from time import monotonic, time
 
+from aiohttp import ClientResponse
 from yarl import URL
 
 from aioamazondevices.const.devices import DEVICE_TYPE_AQM, SPEAKER_GROUP_FAMILY
@@ -85,6 +87,25 @@ class AlexaCommunicationsHandler:
         """Set allowed dropin state for device."""
         await self._set_communications_state("dropin", device, state.value)
 
+    async def _request_preferences(self, url: URL) -> ClientResponse:
+        """Retry a preferences 503 once after five seconds without server guidance."""
+        try:
+            _, resp = await self._http_wrapper.session_request(
+                method=HTTPMethod.GET, url=url, retry_server_errors=False
+            )
+        except ServiceUnavailable as err:
+            if _retry_after_delay(err.retry_after) is not None:
+                # Let the caller schedule the server's cooldown across polls.
+                raise
+            _LOGGER.info(
+                "Retrying communications preferences once in 5 seconds: %s", url
+            )
+            await asyncio.sleep(5)
+            _, resp = await self._http_wrapper.session_request(
+                method=HTTPMethod.GET, url=url, retry_server_errors=False
+            )
+        return resp
+
     async def get_communication_preferences(
         self, devices: list[AmazonDevice]
     ) -> dict[str, dict[str, str]]:
@@ -117,14 +138,7 @@ class AlexaCommunicationsHandler:
             )
             url = url.with_query(query_string)
             try:
-                _, resp = await self._http_wrapper.session_request(
-                    # These optional reads are serialized across devices. Use
-                    # cached state on server errors and try again next refresh,
-                    # rather than adding seven seconds of waits per device.
-                    method=HTTPMethod.GET,
-                    url=url,
-                    retry_server_errors=False,
-                )
+                resp = await self._request_preferences(url)
             except CannotRetrieveData as err:
                 if isinstance(err, ServiceUnavailable):
                     delay = _retry_after_delay(err.retry_after)
