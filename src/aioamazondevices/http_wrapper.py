@@ -7,15 +7,13 @@ import asyncio
 import base64
 import secrets
 from http import HTTPMethod, HTTPStatus
-from http.cookies import CookieError, Morsel, SimpleCookie
-from logging import DEBUG
+from http.cookies import Morsel, SimpleCookie
 from time import time
 from typing import Any, cast
 
 import orjson
 from aiohttp import (
     ClientConnectionError,
-    ClientError,
     ClientResponse,
     ClientSession,
     ContentTypeError,
@@ -49,7 +47,6 @@ from .exceptions import (
     CannotAuthenticate,
     CannotConnect,
     CannotRetrieveData,
-    ServiceUnavailable,
 )
 from .implementation.request_metrics import RequestMetrics
 from .structures import AmazonSaveDataConfig
@@ -356,73 +353,13 @@ class AmazonHttpWrapper:
         finally:
             self._request_metrics.maybe_log()
 
-    async def _log_preferences_503(self, response: ClientResponse) -> None:
-        """Classify a bounded error sample without logging body or credential values."""
-        sample_limit = 8192
-        sample = b""
-        read_failed = False
-        try:
-            async with asyncio.timeout(2):
-                try:
-                    sample = await response.content.readexactly(sample_limit)
-                except asyncio.IncompleteReadError as err:
-                    sample = err.partial
-        except (TimeoutError, ClientError):
-            read_failed = True
-        finally:
-            response.release()
-
-        body = sample.decode("utf-8", errors="replace").lower()
-        phrases = (
-            "service unavailable",
-            "temporarily unavailable",
-            "internal server error",
-            "access denied",
-            "request blocked",
-            "request could not be satisfied",
-            "sign in",
-            "captcha",
-            "cloudfront",
-            "nginx",
-            "envoy",
-            "upstream",
-        )
-        markers = [phrase for phrase in phrases if phrase in body]
-        cookies: SimpleCookie[str] = SimpleCookie()
-        try:
-            cookies.load(response.request_info.headers.get("Cookie", ""))
-        except CookieError:
-            cookies.clear()
-        known_cookies = (
-            "session-id",
-            "session-token",
-            "ubid-main",
-            "at-main",
-            "sess-at-main",
-            "csrf",
-        )
-        _LOGGER.debug(
-            "Preferences 503 diagnostics: body_markers=%s sample_bytes=%s "
-            "sample_limit_reached=%s read_failed=%s auth_cookie_names=%s "
-            "csrf_header_present=%s redirects=%s",
-            markers,
-            len(sample),
-            len(sample) == sample_limit,
-            read_failed,
-            [name for name in known_cookies if name in cookies],
-            CSRF_COOKIE in response.request_info.headers,
-            len(response.history),
-        )
-
-    async def session_request(  # noqa: PLR0913, PLR0915
+    async def session_request(
         self,
         method: str,
         url: URL,
         input_data: dict[str, Any] | list[dict[str, Any]] | None = None,
         json_data: bool = False,
         extended_headers: dict[str, str] | None = None,
-        *,
-        retry_server_errors: bool = True,
     ) -> tuple[BeautifulSoup, ClientResponse]:
         """Return request response context data."""
         _LOGGER.debug(
@@ -491,14 +428,11 @@ class AmazonHttpWrapper:
 
             # Retry with a delay only for specific HTTP status
             # that can benefits of a back-off
-            if resp.status != HTTPStatus.TOO_MANY_REQUESTS and (
-                not retry_server_errors
-                or resp.status
-                not in (
-                    HTTPStatus.INTERNAL_SERVER_ERROR,
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-            ):
+            if resp.status not in [
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                HTTPStatus.TOO_MANY_REQUESTS,
+            ]:
                 break
 
         if resp is None:
@@ -528,20 +462,6 @@ class AmazonHttpWrapper:
             if not await self._ignore_ap_signin_error(
                 resp
             ) and not await self._ignore_capabilities_error(resp):
-                if resp.status == HTTPStatus.SERVICE_UNAVAILABLE:
-                    retry_after = resp.headers.get("Retry-After")
-                    _LOGGER.debug("503 response Retry-After: %r", retry_after)
-                    if (
-                        _LOGGER.isEnabledFor(DEBUG)
-                        and method == HTTPMethod.GET
-                        and url.path.startswith("/devicesTypes/")
-                        and url.path.endswith("/preferences")
-                    ):
-                        await self._log_preferences_503(resp)
-                    raise ServiceUnavailable(
-                        f"Request failed: {await self.http_phrase_error(resp.status)}",
-                        retry_after=retry_after,
-                    )
                 raise CannotRetrieveData(
                     f"Request failed: {await self.http_phrase_error(resp.status)}"
                 )
