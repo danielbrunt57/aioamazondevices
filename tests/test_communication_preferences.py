@@ -10,45 +10,12 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
-from yarl import URL
 
 from aioamazondevices import http_wrapper
 from aioamazondevices.api import AmazonEchoApi
-from aioamazondevices.exceptions import (
-    CannotAuthenticate,
-    CannotRetrieveData,
-    ServiceUnavailable,
-)
+from aioamazondevices.exceptions import CannotAuthenticate, CannotRetrieveData
 from aioamazondevices.implementation import communication
 from aioamazondevices.structures import AmazonDevice
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("recovered", [True, False])
-async def test_preferences_single_five_second_retry(
-    api: AmazonEchoApi, monkeypatch: pytest.MonkeyPatch, recovered: bool
-) -> None:
-    """A 503 gets just one retry, which can recover or propagate the final error."""
-    response = object()
-    failure = ServiceUnavailable("503")
-    request = AsyncMock(
-        side_effect=[failure, (None, response) if recovered else failure]
-    )
-    sleep = AsyncMock()
-    monkeypatch.setattr(api._http_wrapper, "session_request", request)
-    monkeypatch.setattr(communication.asyncio, "sleep", sleep)
-    url = URL("https://example.com/preferences")
-    if recovered:
-        assert await api._communication_handler._request_preferences(url) is response
-    else:
-        with pytest.raises(ServiceUnavailable):
-            await api._communication_handler._request_preferences(url)
-    expected_attempts = 2
-    assert request.await_count == expected_attempts
-    sleep.assert_awaited_once_with(5)
-    assert all(
-        not call.kwargs["retry_server_errors"] for call in request.await_args_list
-    )
 
 
 @pytest.mark.anyio
@@ -152,11 +119,11 @@ async def test_preferences_cache_continue_and_recover(
             "first": {"communications": "OFF"},
             "second": {"communications": "ON"},
         }
-        assert calls == ["first", "first", "second"]
+        assert calls == ["first", "second"]
         failing = False
         result = await communications.get_communication_preferences(devices)
         assert result["first"] == {"communications": "ON"}
-    assert [call.args[0] for call in sleep.await_args_list if call.args[0]] == [5]
+    assert not [call for call in sleep.await_args_list if call.args[0]]
 
 
 @pytest.mark.parametrize(
@@ -234,8 +201,6 @@ async def test_retry_after_defers_only_failing_device(  # noqa: PLR0913, PLR0917
     monkeypatch.setattr(http_wrapper.asyncio, "sleep", sleep)
     monkeypatch.setattr(communication, "monotonic", lambda: now)
     monkeypatch.setattr(communication, "time", lambda: 1445412480.0)
-    retries = status == HTTPStatus.SERVICE_UNAVAILABLE and header in (None, "invalid")
-    batch_calls = ["first", "first", "second"] if retries else ["first", "second"]
     communications = api._communication_handler
     communications._communication_preferences["first"] = {"communications": "OFF"}
     app = web.Application()
@@ -246,14 +211,18 @@ async def test_retry_after_defers_only_failing_device(  # noqa: PLR0913, PLR0917
         communications._communication_site = server.make_url("/")
         devices = [make_device("first"), make_device("second")]
         await communications.get_communication_preferences(devices)
-        assert calls == batch_calls
+        assert calls == ["first", "second"]
         # A wall-clock adjustment after parsing cannot shorten the cooldown.
         monkeypatch.setattr(communication, "time", lambda: 2000000000.0)
         now = 699.0
         result = await communications.get_communication_preferences(devices)
         assert result["first"] == {"communications": "OFF"}
         assert result["second"] == {"communications": "ON"}
-        assert calls == batch_calls + (["second"] if deferred else batch_calls)
+        assert calls == (
+            ["first", "second", "second"]
+            if deferred
+            else ["first", "second", "first", "second"]
+        )
         recovered = True
         now = 700.0
         result = await communications.get_communication_preferences(devices)
@@ -261,6 +230,4 @@ async def test_retry_after_defers_only_failing_device(  # noqa: PLR0913, PLR0917
         assert "first" not in communications._preferences_retry_at
         assert calls[-2:] == ["first", "second"]
         assert api._http_wrapper.request_metrics["total_since_start"] == len(calls)
-    assert [call.args[0] for call in sleep.await_args_list if call.args[0]] == (
-        [5, 5] if retries else []
-    )
+    assert not [call for call in sleep.await_args_list if call.args[0]]
