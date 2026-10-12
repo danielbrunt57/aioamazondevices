@@ -36,10 +36,6 @@ def _retry_after_delay(value: str | None) -> float | None:
     return delay if isfinite(delay) else None
 
 
-# Temporary comparison scoped to the user's Echo Show 8.
-_PREFERENCES_COMPARISON_SERIAL = "G091GM1031170326"
-
-
 class AlexaCommunicationsHandler:
     """Class to handle Alexa communications."""
 
@@ -105,6 +101,13 @@ class AlexaCommunicationsHandler:
                 continue
             self._preferences_retry_at.pop(device.serial_number, None)
 
+            query_string = {
+                "devicePreferences": [
+                    "communications",
+                    "dropin",
+                    "announcements",
+                ]
+            }
             url = URL.joinpath(
                 self._communication_site,
                 URI_COMM_PREFERENCES.format(
@@ -112,82 +115,51 @@ class AlexaCommunicationsHandler:
                     serial_number=device.serial_number,
                 ),
             )
-            comparison = device.serial_number == _PREFERENCES_COMPARISON_SERIAL
-            groups = [("communications", "dropin", "announcements")]
-            if comparison:
-                groups.extend([("communications",), ("dropin",), ("announcements",)])
-            for requested in groups:
-                label = "combined" if len(requested) > 1 else requested[0]
-                request_url = url.with_query({"devicePreferences": list(requested)})
-                try:
-                    _, resp = await self._http_wrapper.session_request(
-                        # These optional reads are serialized across devices. Use
-                        # cached state on server errors and try again next refresh,
-                        # rather than adding seven seconds of waits per device.
-                        method=HTTPMethod.GET,
-                        url=request_url,
-                        retry_server_errors=False,
-                    )
-                except CannotRetrieveData as err:
-                    if comparison:
-                        _LOGGER.info(
-                            "Preferences comparison: device=%s query=%s "
-                            "result=failed error=%s",
-                            device.account_name,
-                            label,
-                            type(err).__name__,
+            url = url.with_query(query_string)
+            try:
+                _, resp = await self._http_wrapper.session_request(
+                    # These optional reads are serialized across devices. Use
+                    # cached state on server errors and try again next refresh,
+                    # rather than adding seven seconds of waits per device.
+                    method=HTTPMethod.GET,
+                    url=url,
+                    retry_server_errors=False,
+                )
+            except CannotRetrieveData as err:
+                if isinstance(err, ServiceUnavailable):
+                    delay = _retry_after_delay(err.retry_after)
+                    if delay is not None:
+                        self._preferences_retry_at[device.serial_number] = (
+                            monotonic() + delay
                         )
-                    if isinstance(err, ServiceUnavailable):
-                        delay = _retry_after_delay(err.retry_after)
-                        if delay is not None:
-                            self._preferences_retry_at[device.serial_number] = (
-                                monotonic() + delay
-                            )
-                            _LOGGER.debug(
-                                "Deferring communications preferences for device %s "
-                                "for %s seconds per Retry-After",
-                                device.account_name,
-                                delay,
-                            )
-                    _LOGGER.warning(
-                        "Failed to refresh communications settings for device %s, used cached values.",  # noqa: E501
-                        device.account_name,
-                    )
-                    if device.serial_number in self._preferences_retry_at:
-                        break
-                    continue
-                if comparison:
-                    _LOGGER.info(
-                        "Preferences comparison: device=%s query=%s result=%s",
-                        device.account_name,
-                        label,
-                        resp.status,
-                    )
-                resp_json = await self._http_wrapper.response_to_json(
-                    resp, "devicesTypes(preferences)"
+                        _LOGGER.debug(
+                            "Deferring communications preferences for device %s "
+                            "for %s seconds per Retry-After",
+                            device.account_name,
+                            delay,
+                        )
+                _LOGGER.warning(
+                    "Failed to refresh communications settings for device %s, used cached values.",  # noqa: E501
+                    device.account_name,
                 )
+                continue
+            resp_json = await self._http_wrapper.response_to_json(
+                resp, "devicesTypes(preferences)"
+            )
 
-                device_communication_preferences: dict[str, str] = (
-                    self._communication_preferences.get(device.serial_number, {}).copy()
-                    if len(requested) == 1
-                    else {}
-                )
-                for device_permissions_pref in resp_json.get(
-                    "devicePermissionsPreferences", {}
-                ):
-                    device_pref = device_permissions_pref["devicePreference"]
-                    pref_state = device_permissions_pref.get("state")
-                    pref_allowed = device_permissions_pref.get("allowed")
+            device_communication_preferences: dict[str, str] = {}
+            for device_permissions_pref in resp_json.get(
+                "devicePermissionsPreferences", {}
+            ):
+                device_pref = device_permissions_pref["devicePreference"]
+                pref_state = device_permissions_pref.get("state")
+                pref_allowed = device_permissions_pref.get("allowed")
 
-                    if device_pref not in requested:
-                        continue
-                    if pref_allowed is True:
-                        device_communication_preferences[device_pref] = pref_state
-                    else:
-                        device_communication_preferences.pop(device_pref, None)
+                if pref_allowed is True:
+                    device_communication_preferences[device_pref] = pref_state
 
-                self._communication_preferences[device.serial_number] = (
-                    device_communication_preferences
-                )
+            self._communication_preferences[device.serial_number] = (
+                device_communication_preferences
+            )
 
         return self._communication_preferences
