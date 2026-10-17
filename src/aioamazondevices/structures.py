@@ -220,6 +220,23 @@ class AmazonVocalRecord:
     person_first_name: str | None = None
     person_type: str | None = None
 
+    @property
+    def activity_title(self) -> str:
+        """Return the display title, including a fallback for routine activity."""
+        if not self.title and self.history_type == "ROUTINES_3P":
+            return "Initiated by routine"
+        return self.title
+
+    @property
+    def voice_command(self) -> str:
+        """Expose the command supplied by the legacy history parser."""
+        return self.title
+
+    @property
+    def voice_reply(self) -> str:
+        """Expose the reply supplied by the legacy history parser."""
+        return self.sub_title
+
 
 class AmazonListType(StrEnum):
     """Amazon list types."""
